@@ -369,6 +369,220 @@ void for_each_parallel(std::istream& in,
     for_each_parallel_impl(in, lambda2, lambda1, NO_WAIT, batch_size, progress);
 }
 
+        template<typename T>
+        void for_each_parallel_impl_shuffle(std::istream &in,
+                                            const std::function<void(T &, T &)> &lambda2,
+                                            const std::function<void(T &)> &lambda1,
+                                            const std::function<bool(void)> &single_threaded_until_true,
+                                            size_t batch_size,
+                                            bool shuffled = false) {
+
+            assert(batch_size % 2 == 0); //for_each_parallel::batch_size must be even
+            // max # of such batches to be holding in memory
+            size_t max_batches_outstanding = 256;
+            // max # we will ever increase the batch buffer to
+            const size_t max_max_batches_outstanding = 1 << 13; // 8192
+            // number of batches currently being processed
+            size_t batches_outstanding = 0;
+
+#ifdef debug
+            cerr << "Looping over file in batches of size " << batch_size << endl;
+#endif
+
+            // this loop handles a chunked file with many pieces
+            // such as we might write in a multithreaded process
+#pragma omp parallel default(none) shared(in, lambda1, lambda2, batches_outstanding, max_batches_outstanding, single_threaded_until_true, cerr, batch_size, shuffled)
+#pragma omp single
+            {
+                auto handle = [](bool retval) -> void {
+                    if (!retval) throw std::runtime_error("obsolete, invalid, or corrupt protobuf input");
+                };
+
+                // We do our own multi-threaded Protobuf decoding, but we batch up our strings by pulling them from this iterator.
+                MessageIterator message_it(in);
+
+                std::vector <std::string> *batch = nullptr;
+                std::unordered_map<string, string> pair_finder;
+
+
+                bool succeeded = false;
+
+                while (message_it.has_current()) {
+                    // Until we run out of messages, grab them with their tags
+                    auto tag_and_data = std::move(message_it.take());
+
+                    // Check the tag.
+                    // TODO: we should only do this when it changes!
+                    handle(Registry::check_protobuf_tag<T>(tag_and_data.first));
+                    // Make sure we have a batch
+                    if (batch == nullptr) {
+                        batch = new vector<string>();
+                    }
+
+
+                    // This is when the input gam file is shuffled/sorted and the pair are not adjacent
+                    if (shuffled) {
+                        std::function<T(string &)> get_obj = [&](string& data) {
+                            T obj1;
+                            handle(ProtobufIterator < T > ::parse_from_string(obj1, data));
+                            return obj1;
+                        };
+                        std::function<string(string&)> locate_pair  = [&](string& data) -> string {
+                            succeeded = false;
+                            T obj = get_obj(data);
+                            string name = obj.name();
+                            auto it = pair_finder.find(name);
+                            if (it != pair_finder.end()){
+                                // This means we found the pair
+//                                cerr << "Found the pair!!" << endl;
+                                succeeded = true;
+                                pair_finder.erase(name);
+                                return it->second;
+
+                            } else {
+                                pair_finder[name] = std::move(data);
+                                return "";
+                            }
+                        };
+
+                        succeeded = false;
+                        // for each obj, first have to find its pair and then push them into the batch
+//                        T obj = get_obj(*tag_and_data.second);
+                        string pair_data = locate_pair(*tag_and_data.second);
+                        // if successful send both pairs to the batch
+                        if (succeeded){
+                            batch->push_back(std::move(*tag_and_data.second));
+                            batch->push_back(std::move(pair_data));
+                        }
+
+
+
+                    } else {
+                        if (tag_and_data.second.get() != nullptr) {
+                            // Add the message to the batch, if it exists
+                            batch->push_back(std::move(*tag_and_data.second));
+                        }
+
+                    }
+
+
+                    if (batch->size() == batch_size) {
+#ifdef debug
+                        cerr << "Found full batch of size " << batch_size << endl;
+#endif
+
+                        // time to enqueue this batch for processing. first, block if
+                        // we've hit max_batches_outstanding.
+                        size_t b;
+#pragma omp atomic capture
+                        b = ++batches_outstanding;
+
+                        bool do_single_threaded = !single_threaded_until_true();
+                        if (b >= max_batches_outstanding || do_single_threaded) {
+
+#ifdef debug
+                            cerr << "Run batch in current thread" << endl;
+#endif
+
+                            // process this batch in the current thread
+                            {
+                                T obj1, obj2;
+                                for (int i = 0; i < batch_size; i += 2) {
+                                    // parse protobuf objects and invoke lambda on the pair
+                                    handle(ProtobufIterator < T > ::parse_from_string(obj1, batch->at(i)));
+                                    handle(ProtobufIterator < T > ::parse_from_string(obj2, batch->at(i + 1)));
+                                    lambda2(obj1, obj2);
+                                }
+                            } // scope obj1 & obj2
+                            delete batch;
+#pragma omp atomic capture
+                            b = --batches_outstanding;
+
+                            if (4 * b / 3 < max_batches_outstanding
+                                && max_batches_outstanding < max_max_batches_outstanding
+                                && !do_single_threaded) {
+                                // we went through at least 1/4 of the batch buffer while we were doing this thread's batch
+                                // this looks risky, since we want the batch buffer to stay populated the entire time we're
+                                // occupying this thread on compute, so let's increase the batch buffer size
+                                // (skip this adjustment if you're in single-threaded mode and thus expect the buffer to be
+                                // empty)
+                                max_batches_outstanding *= 2;
+                            }
+                        } else {
+#ifdef debug
+                            cerr << "Run batch in task" << endl;
+#endif
+
+                            // spawn a task in another thread to process this batch
+#pragma omp task default(none) firstprivate(batch) shared(batches_outstanding, lambda2, handle, single_threaded_until_true, cerr, batch_size)
+                            {
+#ifdef debug
+                                cerr << "Batch task is running" << endl;
+#endif
+
+                                {
+                                    T obj1, obj2;
+                                    for (int i = 0; i < batch_size; i += 2) {
+                                        // parse protobuf objects and invoke lambda on the pair
+                                        handle(ProtobufIterator < T > ::parse_from_string(obj1, batch->at(i)));
+                                        handle(ProtobufIterator < T > ::parse_from_string(obj2, batch->at(i + 1)));
+                                        lambda2(obj1, obj2);
+                                    }
+                                } // scope obj1 & obj2
+                                delete batch;
+#pragma omp atomic update
+                                batches_outstanding--;
+                            }
+                        }
+
+                        batch = nullptr;
+                    }
+                }
+
+#pragma omp taskwait
+                // process final batch
+                if (batch) {
+#ifdef debug
+                    cerr << "Run final batch of size " << batch->size() << " in current thread" << endl;
+#endif
+                    if (!batch->empty()) {
+                        // We require the batch to not be empty (so we can subtract from the size).
+                        T obj1, obj2;
+                        int i = 0;
+                        for (; i < batch->size() - 1; i += 2) {
+                            handle(ProtobufIterator < T > ::parse_from_string(obj1, batch->at(i)));
+                            handle(ProtobufIterator < T > ::parse_from_string(obj2, batch->at(i + 1)));
+                            lambda2(obj1, obj2);
+                        }
+                        if (i == batch->size() - 1) { // odd last object
+                            handle(ProtobufIterator < T > ::parse_from_string(obj1, batch->at(i)));
+                            lambda1(obj1);
+                        }
+                    }
+                    delete batch;
+                }
+            }
+        }
+
+
+        template<typename T>
+        void for_each_parallel_shuffled_double(std::istream &in,
+                                               const std::function<void(T&,T&)>& lambda2,
+                                               size_t batch_size = 256) {
+            std::function<void(T &)> err1 = [](T &) {
+                throw std::runtime_error(
+                        "io::for_each_parallel_shuffled: expected input stream of shuffled pairs, but it had odd number of elements");
+            };
+            std::function<bool(void)> no_wait = [](void) { return true; };
+//    std::function<void(T &, T &)> lambda2 = [&lambda1](T &o1, T &o2) {
+//        lambda1(o1);
+//        lambda1(o2);
+//    };
+
+
+            for_each_parallel_impl_shuffle(in, lambda2, err1, no_wait, batch_size, true);
+        }
+
 }
 
 }
